@@ -1,0 +1,25 @@
+const express = require('express');
+const http = require('http');
+const { Server } = require('socket.io');
+const path = require('path');
+const app = express(); const server = http.createServer(app); const io = new Server(server);
+app.use(express.static(path.join(__dirname,'public')));
+const rooms = new Map();
+const roles = n => n < 6 ? null : n <= 7 ? ['狼人','狼人','预言家','女巫','村民','村民',...(n===7?['村民']:[])] : n <= 9 ? ['狼人','狼人','预言家','女巫','猎人','村民','村民','村民',...(n===9?['村民']:[])] : ['狼人','狼人','狼人','预言家','女巫','猎人','守卫',...Array(n-7).fill('村民')];
+const shuffle=a=>{for(let i=a.length-1;i>0;i--){const j=Math.floor(Math.random()*(i+1));[a[i],a[j]]=[a[j],a[i]]}return a};
+function emitRoom(room){const data={code:room.code,phase:room.phase,round:room.round,players:room.players.map(p=>({id:p.id,name:p.name,alive:p.alive})),host:room.host,log:room.log.slice(-12),voting:room.phase==='vote',voteCount:Object.keys(room.votes).length};io.to(room.code).emit('room',data); for(const p of room.players)io.to(p.id).emit('privateState',{role:room.phase==='lobby'?null:p.role,alive:p.alive,hasVoted:!!room.votes[p.id]});}
+function fail(socket,message){socket.emit('errorMessage',message)}
+function roomOf(socket){const code=socket.data.code;return rooms.get(code)}
+function resetVote(room){room.votes={}}
+function endCheck(room){const wolves=room.players.filter(p=>p.alive&&p.role==='狼人').length;const good=room.players.filter(p=>p.alive&&p.role!=='狼人').length;if(wolves===0||wolves>=good){room.phase='finished';room.log.push(wolves===0?'好人阵营获胜！':'狼人阵营获胜！');return true}return false}
+io.on('connection',socket=>{
+ socket.on('create',({name},cb)=>{const clean=String(name||'').trim().slice(0,18);if(!clean)return cb({error:'请填写昵称'});let code;do{code=String(Math.floor(100000+Math.random()*900000))}while(rooms.has(code));const r={code,host:socket.id,players:[{id:socket.id,name:clean,alive:true,role:null}],phase:'lobby',round:0,log:['房间已创建，邀请车友加入吧。'],votes:{}};rooms.set(code,r);socket.join(code);socket.data.code=code;cb({code});emitRoom(r)});
+ socket.on('join',({code,name},cb)=>{code=String(code||'').trim();const r=rooms.get(code),clean=String(name||'').trim().slice(0,18);if(!r)return cb({error:'房间不存在'});if(r.phase!=='lobby')return cb({error:'游戏已开始'});if(!clean)return cb({error:'请填写昵称'});if(r.players.length>=12)return cb({error:'房间已满（最多12人）'});if(r.players.some(p=>p.name===clean))return cb({error:'昵称重复'});r.players.push({id:socket.id,name:clean,alive:true,role:null});socket.join(code);socket.data.code=code;cb({code});emitRoom(r)});
+ socket.on('start',()=>{const r=roomOf(socket);if(!r||r.host!==socket.id)return fail(socket,'只有房主可以开始');const deck=roles(r.players.length);if(!deck)return fail(socket,'至少需要6名玩家');shuffle(deck);r.players.forEach((p,i)=>{p.role=deck[i];p.alive=true});r.phase='night';r.round=1;r.log.push('第1夜开始。请闭眼，由线下主持人引导夜间行动。');resetVote(r);emitRoom(r)});
+ socket.on('next',()=>{const r=roomOf(socket);if(!r||r.host!==socket.id)return fail(socket,'只有房主可以操作');if(r.phase==='night'){r.phase='day';r.log.push(`第${r.round}天：天亮了，主持人公布昨夜结果。`)}else if(r.phase==='day'){r.phase='vote';resetVote(r);r.log.push('投票开始，请选择一位要放逐的玩家。')}else if(r.phase==='vote'){return fail(socket,'请等待所有存活玩家投票')}else if(r.phase==='finished'){return fail(socket,'游戏已结束，可重开')}emitRoom(r)});
+ socket.on('vote',({target},cb)=>{const r=roomOf(socket);if(!r||r.phase!=='vote')return cb?.({error:'当前不是投票阶段'});const p=r.players.find(p=>p.id===socket.id);if(!p?.alive)return cb?.({error:'你已出局'});if(r.votes[socket.id])return cb?.({error:'已经投票'});if(target!=='abstain'&&!r.players.some(p=>p.id===target&&p.alive))return cb?.({error:'请选择存活的玩家'});r.votes[socket.id]=target;cb?.({ok:true});const voters=r.players.filter(p=>p.alive);if(Object.keys(r.votes).length===voters.length){const counts={};Object.values(r.votes).forEach(id=>{if(id!=='abstain')counts[id]=(counts[id]||0)+1});const max=Math.max(0,...Object.values(counts));const winners=Object.keys(counts).filter(id=>counts[id]===max);if(winners.length===1){const out=r.players.find(p=>p.id===winners[0]);out.alive=false;r.log.push(`${out.name} 获${max}票，被放逐。`)}else{r.log.push('票数相同或全部弃票，本轮无人放逐。')}if(!endCheck(r)){r.round++;r.phase='night';r.log.push(`第${r.round}夜开始。`)} }emitRoom(r)});
+ socket.on('eliminate',({target})=>{const r=roomOf(socket);if(!r||r.host!==socket.id||!['night','day'].includes(r.phase))return fail(socket,'当前不能标记出局');const p=r.players.find(p=>p.id===target);if(!p||!p.alive)return;p.alive=false;r.log.push(`${p.name} 被主持人标记出局。`);endCheck(r);emitRoom(r)});
+ socket.on('restart',()=>{const r=roomOf(socket);if(!r||r.host!==socket.id)return;r.phase='lobby';r.round=0;r.log=['新一局准备开始。'];resetVote(r);r.players.forEach(p=>{p.alive=true;p.role=null});emitRoom(r)});
+ socket.on('disconnect',()=>{const r=roomOf(socket);if(!r)return;if(r.phase==='lobby'){r.players=r.players.filter(p=>p.id!==socket.id);if(r.host===socket.id)r.host=r.players[0]?.id;if(!r.players.length)rooms.delete(r.code);else emitRoom(r)}else {r.log.push('一名玩家离线，已开始的游戏不会自动移除该玩家。');emitRoom(r)}});
+});
+server.listen(process.env.PORT||3000,()=>console.log(`KUMAGAYA HOT WEREWOLF listening on ${process.env.PORT||3000}`));
